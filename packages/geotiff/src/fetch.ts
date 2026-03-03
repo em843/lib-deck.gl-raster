@@ -1,8 +1,9 @@
-import type { SampleFormat, TiffImage } from "@cogeotiff/core";
-import { TiffTag } from "@cogeotiff/core";
+import type { Compression, SampleFormat, TiffImage } from "@cogeotiff/core";
+import { PlanarConfiguration, TiffTag } from "@cogeotiff/core";
 import { compose, translation } from "@developmentseed/affine";
 import type { RasterArray } from "./array.js";
 import type { ProjJson } from "./crs.js";
+import type { DecodedPixels, DecoderMetadata } from "./decode.js";
 import { decode } from "./decode.js";
 import type { CachedTags } from "./ifd.js";
 import type { DecoderPool } from "./pool/pool.js";
@@ -50,18 +51,13 @@ export async function fetchTile(
     throw new Error("Mask fetching not implemented yet");
   }
 
-  const tile = await self.image.getTile(x, y, { signal });
-  if (tile === null) {
-    throw new Error("Tile not found");
-  }
-
+  const tile = await fetchCogBytes(self, x, y, { signal });
   const {
     bitsPerSample: bitsPerSamples,
     predictor,
     planarConfiguration,
     sampleFormat: sampleFormats,
   } = self.cachedTags;
-  const { bytes, compression } = tile;
   const { sampleFormat, bitsPerSample } = getUniqueSampleFormat(
     sampleFormats,
     bitsPerSamples,
@@ -83,9 +79,7 @@ export async function fetchTile(
     predictor,
     planarConfiguration,
   };
-  const decodedPixels = await (pool
-    ? pool.decode(bytes, compression, decoderMetadata)
-    : decode(bytes, compression, decoderMetadata));
+  const decodedPixels = await decodeTile(tile, decoderMetadata, pool);
 
   const array: RasterArray = {
     ...decodedPixels,
@@ -103,6 +97,108 @@ export async function fetchTile(
     y,
     array: boundless === false ? clipToImageBounds(self, x, y, array) : array,
   };
+}
+
+type GetBytesResponse = { bytes: ArrayBuffer; compression: Compression };
+type ByteRange = Awaited<ReturnType<TiffImage["getTileSize"]>>;
+
+async function decodeTile(
+  tile: GetBytesResponse | GetBytesResponse[],
+  metadata: DecoderMetadata,
+  pool: DecoderPool | undefined,
+): Promise<DecodedPixels> {
+  const decoderFn = (
+    bytes: ArrayBuffer,
+    compression: Compression,
+    meta: DecoderMetadata,
+  ): Promise<DecodedPixels> =>
+    pool
+      ? pool.decode(bytes, compression, meta)
+      : decode(bytes, compression, meta);
+
+  if (Array.isArray(tile)) {
+    // Band-separate: each element is one band's compressed tile
+    const bandMetadata = { ...metadata, samplesPerPixel: 1 };
+    const decodedBands = await Promise.all(
+      tile.map(({ bytes, compression }) =>
+        decoderFn(bytes, compression, bandMetadata),
+      ),
+    );
+    const bands = decodedBands.map((result) =>
+      result.layout === "band-separate" ? result.bands[0]! : result.data,
+    );
+    return { layout: "band-separate", bands };
+  } else {
+    // Pixel-interleaved: single compressed buffer covering all bands
+    // interleaved
+    const { bytes, compression } = tile;
+    return decoderFn(bytes, compression, metadata);
+  }
+}
+
+/** Fetch bytes from a COG, handling whether pixel/band interleaving. */
+async function fetchCogBytes(
+  self: HasTiffReference,
+  x: number,
+  y: number,
+  {
+    signal,
+  }: {
+    signal?: AbortSignal;
+  } = {},
+): Promise<GetBytesResponse | GetBytesResponse[]> {
+  switch (self.cachedTags.planarConfiguration) {
+    case PlanarConfiguration.Contig: {
+      const tile = await self.image.getTile(x, y, { signal });
+      if (tile === null) {
+        throw new Error(`Tile at (${x}, ${y}) not found`);
+      }
+      return tile;
+    }
+    case PlanarConfiguration.Separate:
+      return await fetchBandSeparateTileBytes(self, x, y, { signal });
+    default:
+      throw new Error(
+        `Unsupported PlanarConfiguration: ${self.cachedTags.planarConfiguration}`,
+      );
+  }
+}
+
+async function findBandSeparateTileByteRanges(
+  self: HasTiffReference,
+  x: number,
+  y: number,
+): Promise<ByteRange[]> {
+  // TODO: error here if user-provided band-indexes are out of bounds
+  const { x: tilesPerRow, y: tilesPerColumn } = self.image.tileCount;
+  const tilesPerBand = tilesPerRow * tilesPerColumn;
+  const numBands = self.cachedTags.samplesPerPixel;
+  const tileSizes = [...Array(numBands).keys()].map((band) => {
+    const bandIdx = band * tilesPerBand + y * tilesPerRow + x;
+    return self.image.getTileSize(bandIdx);
+  });
+  return Promise.all(tileSizes);
+}
+
+async function fetchBandSeparateTileBytes(
+  self: HasTiffReference,
+  x: number,
+  y: number,
+  {
+    signal,
+  }: {
+    signal?: AbortSignal;
+  } = {},
+): Promise<GetBytesResponse[]> {
+  const byteRanges = await findBandSeparateTileByteRanges(self, x, y);
+  const buffers = byteRanges.map(async ({ offset, imageSize }) => {
+    const tile = await self.image.getBytes(offset, imageSize, { signal });
+    if (tile === null) {
+      throw new Error(`Tile at (${x}, ${y}) not found`);
+    }
+    return tile;
+  });
+  return Promise.all(buffers);
 }
 
 /**
