@@ -6,6 +6,7 @@ import {
   CreateTexture,
   cieLabToRGB,
   FilterNoDataVal,
+  MaskTexture,
 } from "@developmentseed/deck.gl-raster/gpu-modules";
 import type { GeoTIFF, Overview } from "@developmentseed/geotiff";
 import { parseColormap } from "@developmentseed/geotiff";
@@ -18,6 +19,7 @@ export type TextureDataT = {
   height: number;
   width: number;
   texture: Texture;
+  mask?: Texture;
 };
 
 /**
@@ -106,6 +108,16 @@ function createUnormPipeline(
     });
   }
 
+  if (geotiff.maskImage !== null) {
+    renderPipeline.push({
+      module: MaskTexture,
+      props: {
+        // TODO: how to handle if mask failed to load and is undefined here
+        maskTexture: (data: TextureDataT) => data.mask as Texture,
+      },
+    });
+  }
+
   const toRGBModule = photometricInterpretationToRGB(
     photometric,
     device,
@@ -138,6 +150,7 @@ function createUnormPipeline(
       signal,
     });
     let { array } = tile;
+    const { width, height, mask } = array;
 
     let numSamples = samplesPerPixel;
 
@@ -159,20 +172,33 @@ function createUnormPipeline(
     );
     const bytesPerPixel = (bitsPerSample[0]! / 8) * numSamples;
     const texture = device.createTexture({
-      data: padToAlignment(
-        array.data,
-        array.width,
-        array.height,
-        bytesPerPixel,
-      ),
+      data: padToAlignment(array.data, width, height, bytesPerPixel),
       format: textureFormat,
-      width: array.width,
-      height: array.height,
-      sampler: samplerOptions,
+      width,
+      height,
+      // Use nearest filtering for the mask to avoid interpolated edges/halos
+      sampler: {
+        minFilter: "nearest",
+        magFilter: "nearest",
+      },
     });
+
+    let maskTexture: Texture | undefined;
+    if (mask !== null) {
+      maskTexture = device.createTexture({
+        // Mask is single-channel 8-bit, so bytesPerPixel must be 1
+        data: padToAlignment(mask, width, height, 1),
+        // Single-channel 8-bit texture for the mask
+        format: "r8unorm",
+        width,
+        height,
+        sampler: samplerOptions,
+      });
+    }
 
     return {
       texture,
+      mask: maskTexture,
       height: array.height,
       width: array.width,
     };
