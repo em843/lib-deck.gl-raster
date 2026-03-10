@@ -393,6 +393,9 @@ export class COGLayer<
           id: `${props.id}-raster`,
           width,
           height,
+          //NOTE @em843 this allows opacity styles to get passed down
+          //TODO do this for other props?
+          opacity: this.props.opacity,
           renderPipeline,
           maxError,
           reprojectionFns: {
