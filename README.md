@@ -1,3 +1,9 @@
+# Updates
+
+Fork of deck.gl-raster to solve this issue: https://github.com/developmentseed/deck.gl-raster/issues/325
+
+⚠️ This is actually not being used and can be deleted. I opted to use `pnpm patch` to make the fix instead.
+
 # deck.gl-raster
 
 GPU-accelerated [GeoTIFF][geotiff] and [Cloud-Optimized GeoTIFF][cogeo] (COG) (and _soon_ [Zarr]) visualization in [deck.gl].
